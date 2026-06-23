@@ -1,0 +1,8 @@
+fastapi
+openai
+uvicorn[standard]
+anthropic
+httpx
+python-multipart
+python-dotenv
+pydantic

@@ -1,0 +1,60 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --cream: #FAF8F5;
+  --linen: #EDE8E0;
+  --charcoal: #1C1917;
+  --terracotta: #C4714A;
+  --sage: #8FAF8A;
+  --terracotta-light: #E8A882;
+  --sage-light: #B8D4B3;
+  --charcoal-light: #3C3835;
+  --shadow-sm: 0 1px 3px rgba(28,25,23,0.08);
+  --shadow-md: 0 4px 16px rgba(28,25,23,0.10);
+  --shadow-lg: 0 8px 32px rgba(28,25,23,0.14);
+  --radius: 12px;
+  --radius-sm: 8px;
+}
+
+html {
+  font-size: 16px;
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: 'Inter', sans-serif;
+  background-color: var(--cream);
+  color: var(--charcoal);
+  line-height: 1.6;
+  min-height: 100vh;
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, h4 {
+  font-family: 'Playfair Display', serif;
+  line-height: 1.2;
+}
+
+button {
+  cursor: pointer;
+  font-family: 'Inter', sans-serif;
+}
+
+img {
+  max-width: 100%;
+  display: block;
+}
+
+#root {
+  min-height: 100vh;
+  width: 100%;
+}
+
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: var(--linen); }
+::-webkit-scrollbar-thumb { background: var(--terracotta); border-radius: 3px; }
