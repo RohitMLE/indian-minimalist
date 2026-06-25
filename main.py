@@ -2,6 +2,7 @@ import os
 import base64
 import asyncio
 import json
+import time
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +27,21 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 MODELSLAB_API_KEY = os.getenv("MODELSLAB_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+
+# Cheap structured tasks (room analysis, query generation) run on Haiku —
+# ~3-5x cheaper than Sonnet with no visible quality drop for this work.
+TEXT_MODEL = "claude-haiku-4-5"
+
+# In-memory cache for SerpAPI results. The same "japandi sofa under ₹50k"
+# query repeats across users, so caching cuts paid searches sharply.
+# Keyed by (searchQuery, budget_max); entries expire after SERP_CACHE_TTL.
+SERP_CACHE_TTL = 60 * 60 * 24  # 24 hours
+_serp_cache: dict[tuple, tuple[float, Optional[dict]]] = {}
+
+# Higher-level cache for the whole /products response, keyed by the request
+# shape. The same (room, style, budget, categories) recurs across users, so a
+# hit here skips BOTH the Claude query-gen call AND all SerpAPI searches.
+_products_cache: dict[tuple, tuple[float, list]] = {}
 
 STYLE_DETAILS = {
     "Japandi": "natural wood tones, muted sage and beige, minimal clutter, paper lamp, low furniture, zen atmosphere",
@@ -93,7 +109,7 @@ Target style: {req.style}
 Return ONLY the JSON object, no other text."""
 
     message = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=TEXT_MODEL,
         max_tokens=1024,
         messages=[
             {
@@ -216,51 +232,89 @@ def retailer_url(source: str, title: str, query: str) -> str:
 
 
 async def search_serpapi(query: str, budget_max: int) -> dict | None:
-    """Search Google Shopping India via SerpAPI and return the best result."""
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(
-            "https://serpapi.com/search",
-            params={
-                "engine": "google_shopping",
-                "q": query,
-                "gl": "in",
-                "hl": "en",
-                "currency": "INR",
-                "api_key": SERPAPI_KEY,
-            },
-        )
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        results = data.get("shopping_results", [])
-        if not results:
-            return None
+    """Search Google Shopping India via SerpAPI and return the best result.
+    Returns None on any failure (timeout, error, no results) so the caller
+    can fall back gracefully without crashing the whole batch.
 
-        def parse_price(p: str) -> int:
-            try:
-                return int("".join(c for c in p if c.isdigit())[:7])
-            except Exception:
-                return 0
+    Results are cached for SERP_CACHE_TTL so repeated queries (same style +
+    budget across users) don't re-hit the paid SerpAPI."""
+    cache_key = (query.strip().lower(), budget_max)
+    cached = _serp_cache.get(cache_key)
+    if cached is not None:
+        ts, value = cached
+        if time.time() - ts < SERP_CACHE_TTL:
+            return value
+        del _serp_cache[cache_key]  # expired
 
-        affordable = [r for r in results if budget_max == 0 or parse_price(r.get("price", "0")) <= budget_max]
-        candidates = affordable if affordable else results
-        best = candidates[0]
+    result = await _search_serpapi_uncached(query, budget_max)
+    _serp_cache[cache_key] = (time.time(), result)
+    return result
 
-        source = best.get("source", "")
-        title = best.get("title", "")
-        buy_link = retailer_url(source, title, query)
 
-        return {
-            "title": title,
-            "price": best.get("price", ""),
-            "thumbnail": best.get("thumbnail", ""),
-            "link": buy_link,
-            "source": source,
-        }
+async def _search_serpapi_uncached(query: str, budget_max: int) -> dict | None:
+    """Actual SerpAPI call, no caching. See search_serpapi for behaviour."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                "https://serpapi.com/search",
+                params={
+                    "engine": "google_shopping",
+                    "q": query,
+                    "gl": "in",
+                    "hl": "en",
+                    "currency": "INR",
+                    "api_key": SERPAPI_KEY,
+                },
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            results = data.get("shopping_results", [])
+            if not results:
+                return None
+
+            def parse_price(p: str) -> int:
+                try:
+                    return int("".join(c for c in p if c.isdigit())[:7])
+                except Exception:
+                    return 0
+
+            affordable = [r for r in results if budget_max == 0 or parse_price(r.get("price", "0")) <= budget_max]
+            candidates = affordable if affordable else results
+            best = candidates[0]
+
+            source = best.get("source", "")
+            title = best.get("title", "")
+            buy_link = retailer_url(source, title, query)
+
+            return {
+                "title": title,
+                "price": best.get("price", ""),
+                "thumbnail": best.get("thumbnail", ""),
+                "link": buy_link,
+                "source": source,
+            }
+    except Exception:
+        return None
 
 
 @app.post("/products")
 async def products(req: ProductsRequest):
+    # Whole-response cache: same room+style+budget+categories → reuse, skipping
+    # both the Claude query-gen call and every SerpAPI search.
+    cache_key = (
+        req.roomType.strip().lower(),
+        req.style.strip().lower(),
+        req.budget.strip().lower(),
+        tuple(c.strip().lower() for c in req.keyCategories[:5]),
+    )
+    cached = _products_cache.get(cache_key)
+    if cached is not None:
+        ts, value = cached
+        if time.time() - ts < SERP_CACHE_TTL:
+            return value
+        del _products_cache[cache_key]
+
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     style_desc = STYLE_DETAILS.get(req.style, req.style)
 
@@ -290,7 +344,7 @@ Return a JSON array (no markdown, pure JSON) of exactly 5 objects:
 Make queries specific enough to find real Indian products. Return ONLY the JSON array."""
 
     message = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=TEXT_MODEL,
         max_tokens=800,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -331,5 +385,6 @@ Make queries specific enough to find real Indian products. Return ONLY the JSON 
             "searchQuery": cat["searchQuery"],
         }
 
-    results = await asyncio.gather(*[enrich(c) for c in categories])
-    return list(results)
+    results = list(await asyncio.gather(*[enrich(c) for c in categories]))
+    _products_cache[cache_key] = (time.time(), results)
+    return results
