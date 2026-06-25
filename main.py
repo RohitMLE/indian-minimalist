@@ -210,23 +210,35 @@ async def _edit_image(
     prompt: str,
     ref_products: list[ProductForImage],
     client: httpx.AsyncClient,
+    quality: str = "",
 ) -> str:
     """Call gpt-image-2 to edit base_image_bytes, attaching any product
-    thumbnails as reference images. Returns a data-URL string."""
+    thumbnails as reference images. Returns a data-URL string.
+
+    Thumbnails are fetched concurrently (not in a blocking loop) with a short
+    timeout so one slow image can't stall the whole request. `quality` trades
+    speed/cost against fidelity — gpt-image-2 timings: low ~20s, medium ~100s,
+    high ~135s. Empty string = omit (server default, ~21s). Use "low" for fast
+    interactive edits; leave default for the initial hero render."""
     import io
 
-    files = [("image[]", ("room.jpg", io.BytesIO(base_image_bytes), "image/jpeg"))]
-    for idx, p in enumerate(ref_products):
+    async def fetch_thumb(idx: int, p: ProductForImage):
         if not p.thumbnail:
-            continue
+            return None
         try:
-            timg = await client.get(p.thumbnail, timeout=15.0)
+            timg = await client.get(p.thumbnail, timeout=8.0)
             if timg.status_code == 200 and timg.content:
-                files.append(
-                    ("image[]", (f"product_{idx}.jpg", io.BytesIO(timg.content), "image/jpeg"))
-                )
+                return (idx, timg.content)
         except Exception:
-            pass  # skip thumbnails that fail to download
+            pass
+        return None
+
+    files = [("image[]", ("room.jpg", io.BytesIO(base_image_bytes), "image/jpeg"))]
+    fetched = await asyncio.gather(*[fetch_thumb(i, p) for i, p in enumerate(ref_products)])
+    for item in fetched:
+        if item is not None:
+            idx, content = item
+            files.append(("image[]", (f"product_{idx}.jpg", io.BytesIO(content), "image/jpeg")))
 
     resp = await client.post(
         "https://api.openai.com/v1/images/edits",
@@ -237,6 +249,7 @@ async def _edit_image(
             "prompt": prompt[:4000],
             "n": "1",
             "size": "1024x1024",
+            **({"quality": quality} if quality else {}),
         },
     )
     if resp.status_code != 200:
@@ -356,7 +369,8 @@ Decide how to edit the image. Return ONLY a JSON object:
         )
 
     async with httpx.AsyncClient(timeout=180.0) as client:
-        image_url = await _edit_image(base_bytes, prompt, ref_products, client)
+        # "low" keeps interactive edits fast (~20s vs ~100s for medium).
+        image_url = await _edit_image(base_bytes, prompt, ref_products, client, quality="low")
 
     return {"imageUrl": image_url, "reply": reply}
 
