@@ -32,16 +32,53 @@ SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 # ~3-5x cheaper than Sonnet with no visible quality drop for this work.
 TEXT_MODEL = "claude-haiku-4-5"
 
-# In-memory cache for SerpAPI results. The same "japandi sofa under ₹50k"
-# query repeats across users, so caching cuts paid searches sharply.
-# Keyed by (searchQuery, budget_max); entries expire after SERP_CACHE_TTL.
 SERP_CACHE_TTL = 60 * 60 * 24  # 24 hours
-_serp_cache: dict[tuple, tuple[float, Optional[dict]]] = {}
 
-# Higher-level cache for the whole /products response, keyed by the request
-# shape. The same (room, style, budget, categories) recurs across users, so a
-# hit here skips BOTH the Claude query-gen call AND all SerpAPI searches.
-_products_cache: dict[tuple, tuple[float, list]] = {}
+# ── Cache layer ──────────────────────────────────────────────────────────
+# Redis-backed cache (shared across server instances, survives restarts) with
+# a transparent in-memory fallback so the app keeps working if Redis is down.
+# Values are JSON-serialised; keys are namespaced strings.
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+try:
+    import redis.asyncio as aioredis
+
+    _redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+except Exception:
+    _redis = None
+
+# Fallback store used when Redis is unreachable: {key: (expiry_ts, value)}.
+_mem_cache: dict[str, tuple[float, object]] = {}
+
+
+async def cache_get(key: str):
+    """Return the cached value for key, or None. Tries Redis, falls back to
+    the in-memory dict if Redis errors. A sentinel-free miss returns None."""
+    if _redis is not None:
+        try:
+            raw = await _redis.get(key)
+            return json.loads(raw) if raw is not None else None
+        except Exception:
+            pass  # fall through to in-memory
+    entry = _mem_cache.get(key)
+    if entry is not None:
+        expiry, value = entry
+        if time.time() < expiry:
+            return value
+        del _mem_cache[key]
+    return None
+
+
+async def cache_set(key: str, value, ttl: int = SERP_CACHE_TTL):
+    """Store value under key with a TTL (seconds). Writes to Redis when
+    available and always to the in-memory fallback so a later Redis outage
+    still has something to serve."""
+    if _redis is not None:
+        try:
+            await _redis.set(key, json.dumps(value), ex=ttl)
+        except Exception:
+            pass
+    _mem_cache[key] = (time.time() + ttl, value)
 
 STYLE_DETAILS = {
     "Japandi": "natural wood tones, muted sage and beige, minimal clutter, paper lamp, low furniture, zen atmosphere",
@@ -80,6 +117,19 @@ class ProductsRequest(BaseModel):
     style: str
     budget: str
     keyCategories: list[str]
+
+
+@app.get("/health")
+async def health():
+    """Report which cache backend is live (redis vs in-memory fallback)."""
+    backend = "memory"
+    if _redis is not None:
+        try:
+            await _redis.ping()
+            backend = "redis"
+        except Exception:
+            backend = "memory (redis unreachable)"
+    return {"status": "ok", "cache": backend}
 
 
 @app.post("/analyse")
@@ -248,19 +298,17 @@ async def search_serpapi(
     ₹50k") be reused across users even when the exact phrasing differs.
     Falls back to the query text when category/style aren't supplied."""
     if category and style:
-        cache_key = (category.strip().lower(), style.strip().lower(), budget_max)
+        cache_key = f"serp:{category.strip().lower()}:{style.strip().lower()}:{budget_max}"
     else:
-        cache_key = (query.strip().lower(), budget_max)
+        cache_key = f"serp:q:{query.strip().lower()}:{budget_max}"
 
-    cached = _serp_cache.get(cache_key)
+    cached = await cache_get(cache_key)
     if cached is not None:
-        ts, value = cached
-        if time.time() - ts < SERP_CACHE_TTL:
-            return value
-        del _serp_cache[cache_key]  # expired
+        return cached
 
     result = await _search_serpapi_uncached(query, budget_max)
-    _serp_cache[cache_key] = (time.time(), result)
+    if result is not None:
+        await cache_set(cache_key, result)
     return result
 
 
@@ -315,18 +363,14 @@ async def _search_serpapi_uncached(query: str, budget_max: int) -> dict | None:
 async def products(req: ProductsRequest):
     # Whole-response cache: same room+style+budget+categories → reuse, skipping
     # both the Claude query-gen call and every SerpAPI search.
+    cats = ",".join(c.strip().lower() for c in req.keyCategories[:5])
     cache_key = (
-        req.roomType.strip().lower(),
-        req.style.strip().lower(),
-        req.budget.strip().lower(),
-        tuple(c.strip().lower() for c in req.keyCategories[:5]),
+        f"products:{req.roomType.strip().lower()}:{req.style.strip().lower()}:"
+        f"{req.budget.strip().lower()}:{cats}"
     )
-    cached = _products_cache.get(cache_key)
+    cached = await cache_get(cache_key)
     if cached is not None:
-        ts, value = cached
-        if time.time() - ts < SERP_CACHE_TTL:
-            return value
-        del _products_cache[cache_key]
+        return cached
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     style_desc = STYLE_DETAILS.get(req.style, req.style)
@@ -401,5 +445,5 @@ Make queries specific enough to find real Indian products. Return ONLY the JSON 
         }
 
     results = list(await asyncio.gather(*[enrich(c) for c in categories]))
-    _products_cache[cache_key] = (time.time(), results)
+    await cache_set(cache_key, results)
     return results
