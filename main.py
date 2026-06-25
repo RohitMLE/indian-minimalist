@@ -231,14 +231,27 @@ def retailer_url(source: str, title: str, query: str) -> str:
     return f"https://www.google.com/search?tbm=shop&q={q.replace(' ', '+')}&gl=in"
 
 
-async def search_serpapi(query: str, budget_max: int) -> dict | None:
+async def search_serpapi(
+    query: str,
+    budget_max: int,
+    category: str = "",
+    style: str = "",
+) -> dict | None:
     """Search Google Shopping India via SerpAPI and return the best result.
     Returns None on any failure (timeout, error, no results) so the caller
     can fall back gracefully without crashing the whole batch.
 
-    Results are cached for SERP_CACHE_TTL so repeated queries (same style +
-    budget across users) don't re-hit the paid SerpAPI."""
-    cache_key = (query.strip().lower(), budget_max)
+    Results are cached for SERP_CACHE_TTL. The cache is keyed on
+    (category, style, budget) rather than the raw query string, because the
+    query wording is regenerated each time and varies — keying on the stable
+    (category, style, budget) triple lets the same lookup ("Japandi sofa under
+    ₹50k") be reused across users even when the exact phrasing differs.
+    Falls back to the query text when category/style aren't supplied."""
+    if category and style:
+        cache_key = (category.strip().lower(), style.strip().lower(), budget_max)
+    else:
+        cache_key = (query.strip().lower(), budget_max)
+
     cached = _serp_cache.get(cache_key)
     if cached is not None:
         ts, value = cached
@@ -359,7 +372,9 @@ Make queries specific enough to find real Indian products. Return ONLY the JSON 
 
     # Step 2: Search SerpAPI for each category in parallel
     async def enrich(cat: dict) -> dict:
-        result = await search_serpapi(cat["searchQuery"], budget_max)
+        result = await search_serpapi(
+            cat["searchQuery"], budget_max, category=cat["category"], style=req.style
+        )
         if result and result["title"]:
             return {
                 "category": cat["category"],
