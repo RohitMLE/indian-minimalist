@@ -119,6 +119,14 @@ class ProductsRequest(BaseModel):
     keyCategories: list[str]
 
 
+class RefineRequest(BaseModel):
+    image: str  # current generated image (data URL) to edit
+    message: str  # user's natural-language change request
+    style: str = ""
+    products: list[ProductForImage] = []
+    history: list[dict] = []  # [{role, content}] prior chat turns
+
+
 @app.get("/health")
 async def health():
     """Report which cache backend is live (redis vs in-memory fallback)."""
@@ -191,35 +199,65 @@ Return ONLY the JSON object, no other text."""
         raise HTTPException(status_code=500, detail="Failed to parse AI response")
 
 
-@app.post("/transform")
-async def transform(req: TransformRequest):
+def _decode_image(data_url: str) -> bytes:
+    """Decode a base64 data URL (or raw base64) to bytes."""
+    data = data_url.split(",", 1)[1] if "," in data_url else data_url
+    return base64.b64decode(data)
+
+
+async def _edit_image(
+    base_image_bytes: bytes,
+    prompt: str,
+    ref_products: list[ProductForImage],
+    client: httpx.AsyncClient,
+) -> str:
+    """Call gpt-image-2 to edit base_image_bytes, attaching any product
+    thumbnails as reference images. Returns a data-URL string."""
     import io
 
-    image_data = req.image
-    if "," in image_data:
-        image_data = image_data.split(",", 1)[1]
-    image_bytes = base64.b64decode(image_data)
+    files = [("image[]", ("room.jpg", io.BytesIO(base_image_bytes), "image/jpeg"))]
+    for idx, p in enumerate(ref_products):
+        if not p.thumbnail:
+            continue
+        try:
+            timg = await client.get(p.thumbnail, timeout=15.0)
+            if timg.status_code == 200 and timg.content:
+                files.append(
+                    ("image[]", (f"product_{idx}.jpg", io.BytesIO(timg.content), "image/jpeg"))
+                )
+        except Exception:
+            pass  # skip thumbnails that fail to download
+
+    resp = await client.post(
+        "https://api.openai.com/v1/images/edits",
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+        files=files,
+        data={
+            "model": "gpt-image-2",
+            "prompt": prompt[:4000],
+            "n": "1",
+            "size": "1024x1024",
+        },
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"OpenAI error: {resp.text[:300]}")
+
+    result = resp.json()
+    b64 = result["data"][0].get("b64_json")
+    if b64:
+        return f"data:image/png;base64,{b64}"
+    image_url = result["data"][0].get("url")
+    if image_url:
+        return image_url
+    raise HTTPException(status_code=500, detail="No image in OpenAI response")
+
+
+@app.post("/transform")
+async def transform(req: TransformRequest):
+    image_bytes = _decode_image(req.image)
 
     async with httpx.AsyncClient(timeout=180.0) as client:
-        # ── Build multipart: room photo is the base image, product thumbnails
-        #    are reference images so the room is furnished with REAL products. ──
-        files = [("image[]", ("room.jpg", io.BytesIO(image_bytes), "image/jpeg"))]
-
-        product_lines = []
-        for idx, p in enumerate(req.products):
-            label = f"{p.category}: {p.name}"
-            product_lines.append(f"{idx + 1}. {label}")
-            if p.thumbnail:
-                try:
-                    timg = await client.get(p.thumbnail, timeout=15.0)
-                    if timg.status_code == 200 and timg.content:
-                        files.append(
-                            ("image[]", (f"product_{idx}.jpg", io.BytesIO(timg.content), "image/jpeg"))
-                        )
-                except Exception:
-                    pass  # skip thumbnails that fail to download
-
-        # ── Compose a prompt that ties the generated room to the real products ──
+        product_lines = [f"{i + 1}. {p.category}: {p.name}" for i, p in enumerate(req.products)]
         style_desc = STYLE_DETAILS.get(req.style, req.style)
         if product_lines:
             prompt = (
@@ -236,31 +274,91 @@ async def transform(req: TransformRequest):
         else:
             prompt = req.sdPrompt
 
-        resp = await client.post(
-            "https://api.openai.com/v1/images/edits",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            files=files,
-            data={
-                "model": "gpt-image-2",
-                "prompt": prompt[:4000],
-                "n": "1",
-                "size": "1024x1024",
-            },
+        image_url = await _edit_image(image_bytes, prompt, req.products, client)
+        return {"imageUrl": image_url}
+
+
+@app.post("/refine")
+async def refine(req: RefineRequest):
+    """Conversational image editor. The user describes a change in natural
+    language ("swap the sofa for #2", "make the rug darker", "warmer lighting")
+    and we regenerate the current image accordingly, pulling in the relevant
+    real-product reference image when a swap is requested."""
+    if not req.message.strip():
+        raise HTTPException(status_code=400, detail="Empty message")
+
+    client_anthropic = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    # ── Step 1: Claude turns the casual request into a precise edit instruction
+    #    and picks which available products (if any) to use as references. ──
+    catalog = "\n".join(
+        f"{i + 1}. {p.category}: {p.name}" for i, p in enumerate(req.products)
+    ) or "(no product list available)"
+    history_txt = "\n".join(
+        f"{h.get('role', 'user')}: {h.get('content', '')}" for h in req.history[-6:]
+    )
+
+    planner_prompt = f"""You are an interior-design image-edit assistant. The user is refining a generated {req.style} room image.
+
+Available real products the user can place (referenced by number):
+{catalog}
+
+Recent conversation:
+{history_txt or '(none)'}
+
+User's new request: "{req.message}"
+
+Decide how to edit the image. Return ONLY a JSON object:
+{{
+  "editInstruction": "a precise, visual instruction for an image editor describing exactly what to change, e.g. 'Replace the existing sofa with a low-profile cane sofa in natural wood; keep everything else identical'. Always say to keep the room architecture (walls, windows, floor) unchanged.",
+  "productRefs": [list of product NUMBERS from the catalog above to use as visual references, or empty list if the change is not about a specific catalog product],
+  "reply": "one short friendly sentence to show the user, e.g. 'Swapped in the cane sofa — take a look.'"
+}}"""
+
+    msg = client_anthropic.messages.create(
+        model=TEXT_MODEL,
+        max_tokens=500,
+        messages=[{"role": "user", "content": planner_prompt}],
+    )
+    text = msg.content[0].text.strip()
+    start, end = text.find("{"), text.rfind("}") + 1
+    try:
+        plan = json.loads(text[start:end])
+    except Exception:
+        plan = {"editInstruction": req.message, "productRefs": [], "reply": "Updated the design."}
+
+    edit_instruction = plan.get("editInstruction", req.message)
+    reply = plan.get("reply", "Updated the design.")
+    refs_idx = plan.get("productRefs", []) or []
+
+    # Map 1-based product numbers to the actual products for reference images.
+    ref_products: list[ProductForImage] = []
+    for n in refs_idx:
+        try:
+            i = int(n) - 1
+            if 0 <= i < len(req.products):
+                ref_products.append(req.products[i])
+        except (ValueError, TypeError):
+            pass
+
+    # ── Step 2: regenerate the image from the CURRENT image + instruction ──
+    base_bytes = _decode_image(req.image)
+    prompt = (
+        f"This is a {req.style} interior room. {edit_instruction} "
+        "Keep the room's architecture (walls, windows, floor layout) and all "
+        "unmentioned furniture exactly the same. Photorealistic interior design "
+        "photography, 4k, architectural digest, professional lighting, high quality."
+    )
+    if ref_products:
+        prompt += (
+            " The additional images are the real product(s) to use — match their "
+            "shape, colour, material and design closely."
         )
 
-        if resp.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"OpenAI error: {resp.text[:300]}")
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        image_url = await _edit_image(base_bytes, prompt, ref_products, client)
 
-        result = resp.json()
-        b64 = result["data"][0].get("b64_json")
-        if b64:
-            return {"imageUrl": f"data:image/png;base64,{b64}"}
-
-        image_url = result["data"][0].get("url")
-        if image_url:
-            return {"imageUrl": image_url}
-
-        raise HTTPException(status_code=500, detail="No image in OpenAI response")
+    return {"imageUrl": image_url, "reply": reply}
 
 
 def retailer_url(source: str, title: str, query: str) -> str:

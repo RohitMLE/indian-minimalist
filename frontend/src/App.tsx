@@ -26,6 +26,11 @@ interface Product {
 
 type Step = 'idle' | 'analysing' | 'transforming' | 'products' | 'done'
 
+interface ChatMsg {
+  role: 'user' | 'assistant'
+  content: string
+}
+
 // ── Constants ──────────────────────────────────────
 const STYLES = [
   { name: 'Japandi', emoji: '🌿', desc: 'Natural wood, zen calm' },
@@ -81,6 +86,10 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'before' | 'after'>('before')
   const [copied, setCopied] = useState(false)
   const [error, setError] = useState<string>('')
+  // ── Chat / refine state ──
+  const [chat, setChat] = useState<ChatMsg[]>([])
+  const [chatInput, setChatInput] = useState('')
+  const [refining, setRefining] = useState(false)
 
   const handleFile = useCallback(async (file: File) => {
     if (!file.type.startsWith('image/')) return
@@ -166,6 +175,41 @@ export default function App() {
       setStep('idle')
     }
   }
+
+  const sendRefine = async (msg?: string) => {
+    const text = (msg ?? chatInput).trim()
+    if (!text || refining || !transformedUrl) return
+    setChatInput('')
+    setError('')
+    const newChat: ChatMsg[] = [...chat, { role: 'user', content: text }]
+    setChat(newChat)
+    setRefining(true)
+    setActiveTab('after')
+    try {
+      const res = await fetch('http://localhost:8000/refine', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          image: transformedUrl,
+          message: text,
+          style: selectedStyle,
+          products: products.map(p => ({ category: p.category, name: p.name, thumbnail: p.thumbnail })),
+          history: chat,
+        }),
+      })
+      if (!res.ok) throw new Error('Refine failed')
+      const data = await res.json()
+      setTransformedUrl(data.imageUrl)
+      setChat([...newChat, { role: 'assistant', content: data.reply || 'Done — updated the design.' }])
+    } catch (err) {
+      setChat([...newChat, { role: 'assistant', content: '⚠ Could not apply that change. Try rephrasing.' }])
+      setError(err instanceof Error ? err.message : 'Refine failed')
+    } finally {
+      setRefining(false)
+    }
+  }
+
+  const QUICK_EDITS = ['Warmer lighting', 'Add more plants', 'Declutter the room', 'Cozier, softer textures']
 
   const copyMoodboard = () => {
     if (!products.length) return
@@ -349,9 +393,51 @@ export default function App() {
                 )}
               </div>
               {step === 'done' && (
-                <div style={{ marginTop: 16 }}>
-                  <div className="cta-row" style={{ marginBottom: 0 }}>
-                    <button className="cta-btn" style={{ fontSize: '0.85rem', padding: '14px 32px' }} onClick={() => { setStep('idle'); setTransformedUrl(''); setProducts([]); setAnalysis(null); }}>
+                <div className="refine-panel">
+                  <div className="refine-header">
+                    <span className="refine-title">✦ Refine your design</span>
+                    <span className="refine-sub">Ask to swap products, change lighting, declutter…</span>
+                  </div>
+
+                  {chat.length > 0 && (
+                    <div className="chat-log">
+                      {chat.map((m, i) => (
+                        <div key={i} className={`chat-msg ${m.role}`}>{m.content}</div>
+                      ))}
+                      {refining && (
+                        <div className="chat-msg assistant">
+                          <span className="spinner" style={{ width: 12, height: 12, borderTopColor: 'var(--terracotta)' }} /> redrawing…
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="quick-edits">
+                    {QUICK_EDITS.map(q => (
+                      <button key={q} className="quick-chip" disabled={refining} onClick={() => sendRefine(q)}>{q}</button>
+                    ))}
+                    {products.slice(0, 4).map((p, i) => (
+                      <button key={`swap-${i}`} className="quick-chip" disabled={refining} onClick={() => sendRefine(`Swap the ${p.category.toLowerCase()} for product ${i + 1} (${p.name})`)}>
+                        ↻ {p.category}
+                      </button>
+                    ))}
+                  </div>
+
+                  <form className="chat-input-row" onSubmit={e => { e.preventDefault(); sendRefine() }}>
+                    <input
+                      className="chat-input"
+                      value={chatInput}
+                      onChange={e => setChatInput(e.target.value)}
+                      placeholder="e.g. make the sofa green, add a floor lamp…"
+                      disabled={refining}
+                    />
+                    <button className="chat-send" type="submit" disabled={refining || !chatInput.trim()}>
+                      {refining ? '…' : 'Send'}
+                    </button>
+                  </form>
+
+                  <div className="cta-row" style={{ marginBottom: 0, marginTop: 14 }}>
+                    <button className="cta-btn" style={{ fontSize: '0.85rem', padding: '14px 32px' }} onClick={() => { setStep('idle'); setTransformedUrl(''); setProducts([]); setAnalysis(null); setChat([]); setChatInput('') }}>
                       ← Try another style
                     </button>
                   </div>

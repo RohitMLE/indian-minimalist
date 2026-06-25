@@ -198,3 +198,51 @@
   border-color: var(--sage);
   color: var(--sage);
 }
+
+/* ── Refine / chat panel ──────────────────────────── */
+.refine-panel {
+  margin-top: 18px;
+  background: white;
+  border: 1px solid var(--linen);
+  border-radius: var(--radius-sm);
+  padding: 18px;
+}
+.refine-header { display: flex; flex-direction: column; gap: 2px; margin-bottom: 12px; }
+.refine-title { font-family: 'Playfair Display', serif; font-size: 1.05rem; color: var(--charcoal); }
+.refine-sub { font-size: 0.74rem; color: rgba(28,25,23,0.5); }
+
+.chat-log {
+  display: flex; flex-direction: column; gap: 8px;
+  max-height: 220px; overflow-y: auto;
+  margin-bottom: 12px; padding-right: 4px;
+}
+.chat-msg {
+  font-size: 0.82rem; line-height: 1.45;
+  padding: 8px 12px; border-radius: 12px; max-width: 85%;
+}
+.chat-msg.user { align-self: flex-end; background: var(--terracotta); color: white; border-bottom-right-radius: 3px; }
+.chat-msg.assistant { align-self: flex-start; background: var(--cream); color: var(--charcoal); border-bottom-left-radius: 3px; display: flex; align-items: center; gap: 6px; }
+
+.quick-edits { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.quick-chip {
+  font-size: 0.74rem; padding: 6px 12px;
+  background: rgba(196,113,74,0.06); color: var(--terracotta);
+  border: 1px solid rgba(196,113,74,0.25); border-radius: 16px;
+  cursor: pointer; transition: all 0.15s;
+}
+.quick-chip:hover:not(:disabled) { background: var(--terracotta); color: white; }
+.quick-chip:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.chat-input-row { display: flex; gap: 8px; }
+.chat-input {
+  flex: 1; padding: 11px 14px; font-size: 0.85rem; font-family: inherit;
+  border: 1px solid var(--linen); border-radius: var(--radius-sm);
+  background: var(--cream); color: var(--charcoal); outline: none;
+}
+.chat-input:focus { border-color: var(--terracotta); }
+.chat-send {
+  padding: 11px 20px; font-size: 0.85rem; font-weight: 500;
+  background: var(--charcoal); color: white; border: none;
+  border-radius: var(--radius-sm); cursor: pointer; transition: opacity 0.15s;
+}
+.chat-send:disabled { opacity: 0.4; cursor: not-allowed; }
